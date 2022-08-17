@@ -591,7 +591,7 @@ impl<'a> DdsPluginRuntime<'a> {
                     let mut sub = match self
                         .zsession
                         .subscribe_with_query(zkey)
-                        .reliable()
+                        .best_effort()
                         .query_selector(&format!("{}/*{}", PUB_CACHE_QUERY_PREFIX, zkey))
                         .wait()
                     {
@@ -606,7 +606,7 @@ impl<'a> DdsPluginRuntime<'a> {
                     let receiver = sub.receiver().clone();
                     (ZSubscriber::QueryingSubscriber(sub), Box::pin(receiver))
                 } else {
-                    let mut sub = match self.zsession.subscribe(zkey).reliable().wait() {
+                    let mut sub = match self.zsession.subscribe(zkey).best_effort().wait() {
                         Ok(s) => s,
                         Err(e) => {
                             return RouteStatus::CreationFailure(format!(
