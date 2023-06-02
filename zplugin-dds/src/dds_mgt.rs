@@ -257,8 +257,6 @@ pub fn create_forwarding_dds_reader(
                 let sub_listener =
                     dds_create_listener(Box::into_raw(arg) as *mut std::os::raw::c_void);
                 dds_lset_data_available(sub_listener, Some(data_forwarder_listener));
-                qos.history.kind = HistoryKind::KEEP_LAST;
-                qos.history.depth = 1;
                 let qos_native = qos.to_qos_native();
                 let reader = dds_create_reader(dp, t, qos_native, sub_listener);
                 Qos::delete_qos_native(qos_native);
