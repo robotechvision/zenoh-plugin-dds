@@ -12,29 +12,31 @@
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
 use crate::qos::{HistoryKind, Qos};
-use async_std::channel::Sender;
 use async_std::task;
 use cyclors::*;
+use flume::Sender;
 use log::{debug, error, warn};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, Serializer};
 use std::collections::HashMap;
 use std::ffi::{CStr, CString};
 use std::mem::MaybeUninit;
 use std::os::raw;
 use std::sync::Arc;
 use std::time::Duration;
-use zenoh::buf::ZBuf;
+use zenoh::buffers::ZBuf;
+use zenoh::prelude::*;
 use zenoh::publication::CongestionControl;
-use zenoh::{prelude::*, Session};
+use zenoh::Session;
+use zenoh_core::SyncResolve;
 
 const MAX_SAMPLES: u32 = 32;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) enum RouteStatus {
-    Routed(String), // Routing is active, String is the zenoh zenoh resource key used for the route
-    NotAllowed,     // Routing was not allowed per configuration
+    Routed(OwnedKeyExpr), // Routing is active, with the zenoh key expression used for the route
+    NotAllowed,           // Routing was not allowed per configuration
     CreationFailure(String), // The route creation failed
-    _QoSConflict,   // A route was already established but with conflicting QoS
+    _QoSConflict,         // A route was already established but with conflicting QoS
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -79,12 +81,15 @@ unsafe extern "C" fn on_data(dr: dds_entity_t, arg: *mut std::os::raw::c_void) {
     let si = si.assume_init();
 
     for i in 0..n {
-        if si[i as usize].valid_data {
-            let sample = samples[i as usize] as *mut dds_builtintopic_endpoint_t;
-            let is_alive = si[i as usize].instance_state == dds_instance_state_DDS_IST_ALIVE;
-            let key = hex::encode((*sample).key.v);
-            let participant_key = hex::encode((*sample).participant_key.v);
-            let keyless = (*sample).key.v[15] == 3 || (*sample).key.v[15] == 4;
+        let sample = samples[i as usize] as *mut dds_builtintopic_endpoint_t;
+        if (*sample).participant_instance_handle == dpih {
+            // Ignore discovery of entities created by our own participant
+            continue;
+        }
+        let is_alive = si[i as usize].instance_state == dds_instance_state_DDS_IST_ALIVE;
+        let key = hex::encode((*sample).key.v);
+
+        if is_alive {
             let topic_name = match CStr::from_ptr((*sample).topic_name).to_str() {
                 Ok(s) => s,
                 Err(e) => {
@@ -92,6 +97,14 @@ unsafe extern "C" fn on_data(dr: dds_entity_t, arg: *mut std::os::raw::c_void) {
                     continue;
                 }
             };
+            if topic_name.starts_with("DCPS") {
+                debug!(
+                    "Ignoring discovery of {} ({} is a builtin topic)",
+                    key, topic_name
+                );
+                continue;
+            }
+
             let type_name = match CStr::from_ptr((*sample).type_name).to_str() {
                 Ok(s) => s,
                 Err(e) => {
@@ -99,14 +112,11 @@ unsafe extern "C" fn on_data(dr: dds_entity_t, arg: *mut std::os::raw::c_void) {
                     continue;
                 }
             };
+            let participant_key = hex::encode((*sample).participant_key.v);
+            let keyless = (*sample).key.v[15] == 3 || (*sample).key.v[15] == 4;
 
             debug!(
-                "{} DDS {} {} from Participant {} on {} with type {} (keyless: {})",
-                if is_alive {
-                    "Discovered"
-                } else {
-                    "Undiscovered"
-                },
+                "Discovered DDS {} {} from Participant {} on {} with type {} (keyless: {})",
                 if pub_discovery {
                     "publication"
                 } else {
@@ -119,42 +129,32 @@ unsafe extern "C" fn on_data(dr: dds_entity_t, arg: *mut std::os::raw::c_void) {
                 keyless
             );
 
-            if topic_name.contains("DCPS") || (*sample).participant_instance_handle == dpih {
-                debug!(
-                    "Ignoring discovery of {} ({}) from local participant",
-                    key, topic_name
-                );
-                continue;
-            }
+            let qos = if pub_discovery {
+                Qos::from_writer_qos_native((*sample).qos)
+            } else {
+                Qos::from_reader_qos_native((*sample).qos)
+            };
 
             // send a DiscoveryEvent
-            if si[i as usize].instance_state == dds_instance_state_DDS_IST_ALIVE {
-                let qos = if pub_discovery {
-                    Qos::from_writer_qos_native((*sample).qos)
-                } else {
-                    Qos::from_reader_qos_native((*sample).qos)
-                };
+            let entity = DdsEntity {
+                key: key.clone(),
+                participant_key: participant_key.clone(),
+                topic_name: String::from(topic_name),
+                type_name: String::from(type_name),
+                keyless,
+                qos,
+                routes: HashMap::<String, RouteStatus>::new(),
+            };
 
-                let entity = DdsEntity {
-                    key: key.clone(),
-                    participant_key: participant_key.clone(),
-                    topic_name: String::from(topic_name),
-                    type_name: String::from(type_name),
-                    keyless,
-                    qos,
-                    routes: HashMap::<String, RouteStatus>::new(),
-                };
-
-                if pub_discovery {
-                    send_discovery_event(&btx.1, DiscoveryEvent::DiscoveredPublication { entity });
-                } else {
-                    send_discovery_event(&btx.1, DiscoveryEvent::DiscoveredSubscription { entity });
-                }
-            } else if pub_discovery {
-                send_discovery_event(&btx.1, DiscoveryEvent::UndiscoveredPublication { key });
+            if pub_discovery {
+                send_discovery_event(&btx.1, DiscoveryEvent::DiscoveredPublication { entity });
             } else {
-                send_discovery_event(&btx.1, DiscoveryEvent::UndiscoveredSubscription { key });
+                send_discovery_event(&btx.1, DiscoveryEvent::DiscoveredSubscription { entity });
             }
+        } else if pub_discovery {
+            send_discovery_event(&btx.1, DiscoveryEvent::UndiscoveredPublication { key });
+        } else {
+            send_discovery_event(&btx.1, DiscoveryEvent::UndiscoveredSubscription { key });
         }
     }
     dds_return_loan(
@@ -219,13 +219,11 @@ unsafe extern "C" fn data_forwarder_listener(dr: dds_entity_t, arg: *mut std::os
             } else {
                 log::trace!("Route data from DDS {} to zenoh key={}", &(*pa).0, &(*pa).1);
             }
-            let _ = task::block_on(async {
-                (*pa)
-                    .2
-                    .put(&(*pa).1, rbuf)
-                    .congestion_control((*pa).3)
-                    .await
-            });
+            let _ = (*pa)
+                .2
+                .put(&(*pa).1, rbuf)
+                .congestion_control((*pa).3)
+                .res_sync();
             (*zp).payload = std::ptr::null_mut();
         }
         cdds_serdata_unref(zp as *mut ddsi_serdata);
@@ -252,7 +250,7 @@ pub fn create_forwarding_dds_reader(
 
         match read_period {
             None => {
-                // Use a Listener to route data as soon as it arraives
+                // Use a Listener to route data as soon as it arrives
                 let arg = Box::new((topic_name, z_key, z, congestion_ctrl));
                 let sub_listener =
                     dds_create_listener(Box::into_raw(arg) as *mut std::os::raw::c_void);
@@ -287,7 +285,7 @@ pub fn create_forwarding_dds_reader(
                 qos.history.depth = 1;
                 let qos_native = qos.to_qos_native();
                 let reader = dds_create_reader(dp, t, qos_native, std::ptr::null());
-                let z_key = z_key.to_owned();
+                let z_key = z_key.into_owned();
                 task::spawn(async move {
                     // loop while reader's instance handle remain the same
                     // (if reader was deleted, its dds_entity_t value might have been
@@ -322,11 +320,10 @@ pub fn create_forwarding_dds_reader(
                                     (*zp).size as usize,
                                 );
                                 let rbuf = ZBuf::from(bs);
-                                let _ = task::block_on(async {
-                                    z.put(&z_key, rbuf)
-                                        .congestion_control(congestion_ctrl)
-                                        .await
-                                });
+                                let _ = z
+                                    .put(&z_key, rbuf)
+                                    .congestion_control(congestion_ctrl)
+                                    .res_sync();
                                 (*zp).payload = std::ptr::null_mut();
                             }
                             cdds_serdata_unref(zp as *mut ddsi_serdata);
@@ -372,7 +369,7 @@ pub fn delete_dds_entity(entity: dds_entity_t) -> Result<(), String> {
         let r = dds_delete(entity);
         match r {
             0 | DDS_RETCODE_ALREADY_DELETED => Ok(()),
-            e => Err(format!("Error deleting DDS entity - retcode={}", e)),
+            e => Err(format!("Error deleting DDS entity - retcode={e}")),
         }
     }
 }
@@ -384,7 +381,17 @@ pub fn get_guid(entity: &dds_entity_t) -> Result<String, String> {
         if r == 0 {
             Ok(hex::encode(guid.v))
         } else {
-            Err(format!("Error getting GUID of DDS entity - retcode={}", r))
+            Err(format!("Error getting GUID of DDS entity - retcode={r}"))
         }
+    }
+}
+
+pub fn serialize_entity_guid<S>(entity: &dds_entity_t, s: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    match get_guid(entity) {
+        Ok(guid) => s.serialize_str(&guid),
+        Err(_) => s.serialize_str("UNKOWN_GUID"),
     }
 }

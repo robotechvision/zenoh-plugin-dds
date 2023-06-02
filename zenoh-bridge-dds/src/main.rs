@@ -1,3 +1,4 @@
+use async_liveliness_monitor::LivelinessMonitor;
 //
 // Copyright (c) 2022 ZettaScale Technology
 //
@@ -12,15 +13,21 @@
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
 use clap::{App, Arg};
-use zenoh::config::Config;
+use std::str::FromStr;
+use std::time::{Duration, SystemTime};
+use zenoh::config::{Config, ModeDependentValue};
 use zenoh::prelude::*;
 
 lazy_static::lazy_static!(
-    pub static ref DEFAULT_DOMAIN_STR: String = zplugin_dds::config::DEFAULT_DOMAIN.to_string();
-    pub static ref DEFAULT_GROUP_LEASE_STR: String = zplugin_dds::config::DEFAULT_GROUP_LEASE_SEC.to_string();
+    pub static ref DEFAULT_DOMAIN_STR: String = zenoh_plugin_dds::config::DEFAULT_DOMAIN.to_string();
 );
 
 macro_rules! insert_json5 {
+    ($config: expr, $args: expr, $key: expr, if $name: expr) => {
+        if $args.occurrences_of($name) > 0 {
+            $config.insert_json5($key, "true").unwrap();
+        }
+    };
     ($config: expr, $args: expr, $key: expr, if $name: expr, $($t: tt)*) => {
         if $args.occurrences_of($name) > 0 {
             $config.insert_json5($key, &serde_json::to_string(&$args.value_of($name).unwrap()$($t)*).unwrap()).unwrap();
@@ -33,10 +40,10 @@ macro_rules! insert_json5 {
     };
 }
 
-fn parse_args() -> Config {
+fn parse_args() -> (Config, Option<f32>) {
     let app = App::new("zenoh bridge for DDS")
-        .version(zplugin_dds::GIT_VERSION)
-        .long_version(zplugin_dds::LONG_VERSION.as_str())
+        .version(zenoh_plugin_dds::GIT_VERSION)
+        .long_version(zenoh_plugin_dds::LONG_VERSION.as_str())
         //
         // zenoh related arguments:
         //
@@ -48,7 +55,7 @@ If not set, a random UUIDv4 will be used.'"#,
             ))
         .arg(Arg::from_usage(
 r#"-m, --mode=[MODE]  'The zenoh session mode.'"#)
-            .possible_values(&["peer", "client"])
+            .possible_values(["peer", "client"])
             .default_value("peer")
         )
         .arg(Arg::from_usage(
@@ -84,24 +91,27 @@ r#"--rest-http-port=[PORT | IP:PORT] \
 r#"-s, --scope=[String]   'A string added as prefix to all routed DDS topics when mapped to a zenoh resource. This should be used to avoid conflicts when several distinct DDS systems using the same topics names are routed via zenoh'"#
         ))
         .arg(Arg::from_usage(
-r#"-d, --domain=[ID]   'The DDS Domain ID (if using with ROS this should be the same as ROS_DOMAIN_ID).'"#)
-            .default_value(&*DEFAULT_DOMAIN_STR)
+r#"-d, --domain=[ID]   'The DDS Domain ID. The default value is "$ROS_DOMAIN_ID" if defined, or "0" otherwise.'"#)
+            .default_value(&DEFAULT_DOMAIN_STR)
         )
+        .arg(Arg::from_usage(
+r#"--dds-localhost-only \
+'Configure CycloneDDS to use only the localhost interface. If not set, CycloneDDS will pick the interface defined in "$CYCLONEDDS_URI" configuration, or automatically choose one.
+This option is not active by default, unless the "ROS_LOCALHOST_ONLY" environement variable is set to "1".'"#
+        ))
         .arg(Arg::from_usage(
 r#"--group-member-id=[ID]   'A custom identifier for the bridge, that will be used in group management (if not specified, the zenoh UUID is used).'"#
         ))
         .arg(Arg::from_usage(
-r#"--group-lease=[Duration]   'The lease duration (in seconds) used in group management for all DDS plugins.'"#)
-            .default_value(&*DEFAULT_GROUP_LEASE_STR)
-        )
-        .arg(Arg::from_usage(
-r#"-a, --allow=[String]   'A regular expression matching the set of 'partition/topic-name' that must be routed via zenoh. By default, all partitions and topics are allowed.
+r#"-a, --allow=[String]...   'A regular expression matching the set of 'partition/topic-name' that must be routed via zenoh. By default, all partitions and topics are allowed.
 If both '--allow' and '--deny' are set a partition and/or topic will be allowed if it matches only the 'allow' expression.
+Repeat this option to configure several topic expressions. These expressions are concatenated with '|'.
 Examples of expressions: '.*/TopicA', 'Partition-?/.*', 'cmd_vel|rosout'...'"#
         ))
         .arg(Arg::from_usage(
-r#"--deny=[String]   'A regular expression matching the set of 'partition/topic-name' that must not be routed via zenoh. By default, no partitions and no topics are denied.
+r#"--deny=[String]...   'A regular expression matching the set of 'partition/topic-name' that must not be routed via zenoh. By default, no partitions and no topics are denied.
 If both '--allow' and '--deny' are set a partition and/or topic will be allowed if it matches only the 'allow' expression.
+Repeat this option to configure several topic expressions. These expressions are concatenated with '|'.
 Examples of expressions: '.*/TopicA', 'Partition-?/.*', 'cmd_vel|rosout'...'"#
         ))
         .arg(Arg::from_usage(
@@ -120,7 +130,15 @@ r#"-w, --generalise-pub=[String]...   'A list of key expression to use for gener
         .arg(Arg::from_usage(
 r#"-f, --fwd-discovery   'When set, rather than creating a local route when discovering a local DDS entity, this discovery info is forwarded to the remote plugins/bridges. Those will create the routes, including a replica of the discovered entity.'"#
             ).alias("forward-discovery")
-        );
+        )
+        .arg(Arg::from_usage(
+r#"--queries-timeout=[float]... 'A float in seconds (default: 5.0 sec) that will be used as a timeout when the bridge
+queries any other remote bridge for discovery information and for historical data for TRANSIENT_LOCAL DDS Readers it serves
+(i.e. if the query to the remote bridge exceed the timeout, some historical samples might be not routed to the Readers, but the route will not be blocked forever)."#
+        ))
+        .arg(Arg::from_usage(
+r#"--watchdog=[PERIOD]   'Experimental!! Run a watchdog thread that monitors the bridge's async executor and reports as error log any stalled status during the specified period (default: 1.0 second)'"#
+        ).default_missing_value("1.0"));
     let args = app.get_matches();
 
     // load config file at first
@@ -137,7 +155,7 @@ r#"-f, --fwd-discovery   'When set, rather than creating a local route when disc
     // NOTE: only if args.occurrences_of()>0 to avoid overriding config with the default arg value
     if args.occurrences_of("id") > 0 {
         config
-            .set_id(args.value_of("id").map(|s| s.to_string()))
+            .set_id(ZenohId::from_str(args.value_of("id").unwrap()).unwrap())
             .unwrap();
     }
     if args.occurrences_of("mode") > 0 {
@@ -162,49 +180,113 @@ r#"-f, --fwd-discovery   'When set, rather than creating a local route when disc
     }
     if let Some(port) = args.value_of("rest-http-port") {
         config
-            .insert_json5("plugins/rest/http_port", &format!(r#""{}""#, port))
+            .insert_json5("plugins/rest/http_port", &format!(r#""{port}""#))
             .unwrap();
     }
-
     // Always add timestamps to publications (required for PublicationCache used in case of TRANSIENT_LOCAL topics)
-    config.set_add_timestamp(Some(true)).unwrap();
+    config
+        .timestamping
+        .set_enabled(Some(ModeDependentValue::Unique(true)))
+        .unwrap();
 
     // apply DDS related arguments over config
     insert_json5!(config, args, "plugins/dds/scope", if "scope",);
     insert_json5!(config, args, "plugins/dds/domain", if "domain", .parse::<u64>().unwrap());
+    insert_json5!(config, args, "plugins/dds/localhost_only", if "dds-localhost-only");
     insert_json5!(config, args, "plugins/dds/group_member_id", if "group-member-id", );
-    insert_json5!(config, args, "plugins/dds/group_lease", if "group-lease", .parse::<f64>().unwrap());
-    insert_json5!(config, args, "plugins/dds/allow", if "allow", );
-    insert_json5!(config, args, "plugins/dds/deny", if "deny", );
+    insert_json5!(config, args, "plugins/dds/allow", for "allow", .collect::<Vec<_>>());
+    insert_json5!(config, args, "plugins/dds/deny", for "deny", .collect::<Vec::<_>>());
     insert_json5!(config, args, "plugins/dds/max_frequencies", for "max-frequency", .collect::<Vec<_>>());
     insert_json5!(config, args, "plugins/dds/generalise_pubs", for "generalise-pub", .collect::<Vec<_>>());
     insert_json5!(config, args, "plugins/dds/generalise_subs", for "generalise-sub", .collect::<Vec<_>>());
+    insert_json5!(config, args, "plugins/dds/queries_timeout", if "queries-timeout", .parse::<f64>().unwrap());
     if args.is_present("fwd-discovery") {
         config
             .insert_json5("plugins/dds/forward_discovery", "true")
             .unwrap();
     }
-    config
+
+    let watchdog_period = if args.is_present("watchdog") {
+        args.value_of("watchdog").map(|s| s.parse::<f32>().unwrap())
+    } else {
+        None
+    };
+
+    (config, watchdog_period)
 }
 
 #[async_std::main]
 async fn main() {
-    use zenoh_plugin_trait::Plugin;
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("z=info")).init();
-    log::info!("zenoh-bridge-dds {}", *zplugin_dds::LONG_VERSION);
+    log::info!("zenoh-bridge-dds {}", *zenoh_plugin_dds::LONG_VERSION);
 
-    let config = parse_args();
+    let (config, watchdog_period) = parse_args();
     let rest_plugin = config.plugin("rest").is_some();
 
+    if let Some(period) = watchdog_period {
+        run_watchdog(period);
+    }
+
     // create a zenoh Runtime (to share with plugins)
-    let runtime = zenoh::net::runtime::Runtime::new(config).await.unwrap();
+    let runtime = zenoh::runtime::Runtime::new(config).await.unwrap();
 
     // start REST plugin
     if rest_plugin {
-        zplugin_rest::RestPlugin::start("rest", &runtime).unwrap();
+        use zenoh_plugin_trait::Plugin;
+        zenoh_plugin_rest::RestPlugin::start("rest", &runtime).unwrap();
     }
 
     // start DDS plugin
-    zplugin_dds::DDSPlugin::start("dds", &runtime).unwrap();
-    async_std::task::block_on(async_std::future::pending::<()>());
+    use zenoh_plugin_trait::Plugin;
+    zenoh_plugin_dds::DDSPlugin::start("dds", &runtime).unwrap();
+    async_std::future::pending::<()>().await;
+}
+
+fn run_watchdog(period: f32) {
+    let sleep_time = Duration::from_secs_f32(period);
+    // max delta accepted for watchdog thread sleep period
+    let max_sleep_delta = Duration::from_millis(50);
+    // 1st threshold of duration since last report => debug info if exceeded
+    let report_threshold_1 = Duration::from_millis(10);
+    // 2nd threshold of duration since last report => debug warn if exceeded
+    let report_threshold_2 = Duration::from_millis(100);
+
+    assert!(
+        sleep_time > report_threshold_2,
+        "Watchdog period must be greater than {} seconds",
+        report_threshold_2.as_secs_f32()
+    );
+
+    // Start a Liveliness Monitor thread for async_std Runtime
+    let (_task, monitor) = LivelinessMonitor::start(async_std::task::spawn);
+    std::thread::spawn(move || {
+        log::debug!(
+            "Watchdog started with period {} sec",
+            sleep_time.as_secs_f32()
+        );
+        loop {
+            let before = SystemTime::now();
+            std::thread::sleep(sleep_time);
+            let elapsed = SystemTime::now().duration_since(before).unwrap();
+
+            // Monitor watchdog thread itself
+            if elapsed > sleep_time + max_sleep_delta {
+                log::warn!(
+                    "Watchdog thread slept more than configured: {} seconds",
+                    elapsed.as_secs_f32()
+                );
+            }
+            // check last LivelinessMonitor's report
+            let report = monitor.latest_report();
+            if report.elapsed() > report_threshold_1 {
+                if report.elapsed() > sleep_time {
+                    log::error!("Watchdog detecting async_std is stalled! No task scheduling since {} seconds", report.elapsed().as_secs_f32());
+                } else if report.elapsed() > report_threshold_2 {
+                    log::warn!("Watchdog detecting async_std was not scheduling tasks during the last {} ms", report.elapsed().as_micros());
+                } else {
+                    log::info!("Watchdog detecting async_std was not scheduling tasks during the last {} ms", report.elapsed().as_micros());
+                }
+            }
+        }
+    });
 }

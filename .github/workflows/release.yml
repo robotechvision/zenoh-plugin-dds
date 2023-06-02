@@ -20,9 +20,6 @@ on:
     - cron: "0 1 * * 1-5"
   workflow_dispatch:
 
-env:
-  cargo-deb-version: 1.35.0
-
 jobs:
   checks:
     name: Code checks
@@ -58,67 +55,32 @@ jobs:
           echo "GITHUB_REF=${GITHUB_REF}"
           echo "GITHUB_SHA=${GITHUB_SHA:0:8}"
           GIT_BRANCH=`[[ $GITHUB_REF =~ ^refs/heads/.* ]] && echo ${GITHUB_REF/refs\/heads\//} || true`
-          echo "GIT_BRANCH=${GIT_BRANCH}"
-          echo ::set-output name=GIT_BRANCH::"${GIT_BRANCH}"
+          echo "GIT_BRANCH=${GIT_BRANCH}" >> $GITHUB_OUTPUT
           GIT_TAG=`[[ $GITHUB_REF =~ ^refs/tags/.* ]] && echo ${GITHUB_REF/refs\/tags\//} || true`
-          echo "GIT_TAG=${GIT_TAG}"
-          echo ::set-output name=GIT_TAG::"${GIT_TAG}"
+          echo "GIT_TAG=${GIT_TAG}" >> $GITHUB_OUTPUT
 
-          ZENOH_VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' zplugin-dds/Cargo.toml | head -n1)
-          echo "ZENOH_VERSION=${ZENOH_VERSION}"
-          echo ::set-output name=ZENOH_VERSION::"${ZENOH_VERSION}"
+          sudo apt-get update
+          sudo apt-get install -y jq
+
+          ZENOH_VERSION=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "zenoh-plugin-dds") | .version')
+          echo "ZENOH_VERSION=${ZENOH_VERSION}" >> $GITHUB_OUTPUT
           if [ -n "${GIT_TAG}" ]; then
             IS_RELEASE="true"
-            echo "IS_RELEASE=${IS_RELEASE}"
-            echo ::set-output name=IS_RELEASE::"${IS_RELEASE}"
+            echo "IS_RELEASE=${IS_RELEASE}" >> $GITHUB_OUTPUT
             PKG_VERSION=${ZENOH_VERSION}
           elif [ -n "${GIT_BRANCH}" ]; then
             PKG_VERSION=${GIT_BRANCH}-${GITHUB_SHA:0:8}
           else
             PKG_VERSION=${ZENOH_VERSION}-${GITHUB_SHA:0:8}
           fi
-          echo "PKG_VERSION=${PKG_VERSION}"
-          echo ::set-output name=PKG_VERSION::"${PKG_VERSION}"
+          echo "PKG_VERSION=${PKG_VERSION}" >> $GITHUB_OUTPUT
+          cat ${GITHUB_OUTPUT}
     outputs:
       GIT_BRANCH: ${{ steps.env.outputs.GIT_BRANCH }}
       GIT_TAG: ${{ steps.env.outputs.GIT_TAG }}
       IS_RELEASE: ${{ steps.env.outputs.IS_RELEASE }}
       ZENOH_VERSION: ${{ steps.env.outputs.ZENOH_VERSION }}
       PKG_VERSION: ${{ steps.env.outputs.PKG_VERSION }}
-
-  docker-build:
-    name: Build Docker image
-    needs: checks
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v2
-        with:
-          fetch-depth: 500 # NOTE: get long history for git-version crate to correctly compute a version
-      - name: Fetch Git tags # NOTE: workaround for https://github.com/actions/checkout/issues/290
-        shell: bash
-        run: git fetch --tags --force
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v1
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v1
-      - name: Docker meta - set tags and labels
-        id: meta
-        uses: docker/metadata-action@v3
-        with:
-          images: eclipse/zenoh-bridge-dds
-      - name: Login to DockerHub
-        uses: docker/login-action@v1
-        with:
-          username: ${{ secrets.DOCKER_COM_USERNAME }}
-          password: ${{ secrets.DOCKER_COM_PASSWORD }}
-      - name: Build and push
-        uses: docker/build-push-action@v2
-        with:
-          context: .
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
 
   builds:
     name: Build for ${{ matrix.job.target }} on ${{ matrix.job.os }}
@@ -130,6 +92,7 @@ jobs:
         job:
           - { target: x86_64-unknown-linux-gnu, arch: amd64, os: ubuntu-20.04 }
           - { target: x86_64-apple-darwin, arch: darwin, os: macos-latest }
+          - { target: aarch64-apple-darwin, arch: darwin, os: macos-latest }
           - {
               target: x86_64-unknown-linux-musl,
               arch: amd64,
@@ -160,6 +123,12 @@ jobs:
               os: ubuntu-20.04,
               use-cross: true,
             }
+          - {
+              target: aarch64-unknown-linux-musl,
+              arch: arm64,
+              os: ubuntu-20.04,
+              use-cross: true,
+            }
           ##
           ## NOTE: cannot build for Windows since cyclocut was not ported to Windows.
           ##
@@ -177,7 +146,7 @@ jobs:
         shell: bash
         run: |
           case ${{ matrix.job.target }} in
-            *-linux-gnu*) cargo install cargo-deb --version ${{ env.cargo-deb-version }};;
+            *-linux-gnu*) cargo install cargo-deb;;
           esac
 
           case ${{ matrix.job.target }} in
@@ -203,12 +172,12 @@ jobs:
           override: true
           profile: minimal
 
-      - name: zplugin-dds > Build
+      - name: zenoh-plugin-dds > Build
         uses: actions-rs/cargo@v1
         with:
           use-cross: ${{ matrix.job.use-cross }}
           command: build
-          args: --release --target=${{ matrix.job.target }} -p zplugin-dds
+          args: --release --target=${{ matrix.job.target }} -p zenoh-plugin-dds
 
       - name: zenoh-bridge-dds > Build
         uses: actions-rs/cargo@v1
@@ -217,12 +186,12 @@ jobs:
           command: build
           args: --release --target=${{ matrix.job.target }} -p zenoh-bridge-dds
 
-      - name: zplugin-dds > Debian package
+      - name: zenoh-plugin-dds > Debian package
         if: contains(matrix.job.target, '-linux-gnu')
         uses: actions-rs/cargo@v1
         with:
           command: deb
-          args: --no-build --target=${{ matrix.job.target }} -p zplugin-dds
+          args: --no-build --target=${{ matrix.job.target }} -p zenoh-plugin-dds
 
       - name: zenoh-bridge-dds > Debian package
         if: contains(matrix.job.target, '-linux-gnu')
@@ -236,20 +205,20 @@ jobs:
         shell: bash
         run: |
           TARGET=${{ matrix.job.target }}
-          LIB_PKG_NAME="${GITHUB_WORKSPACE}/zplugin-dds-${{ needs.checks.outputs.PKG_VERSION }}-${TARGET}.zip"
+          LIB_PKG_NAME="${GITHUB_WORKSPACE}/zenoh-plugin-dds-${{ needs.checks.outputs.PKG_VERSION }}-${TARGET}.zip"
           BIN_PKG_NAME="${GITHUB_WORKSPACE}/zenoh-bridge-dds-${{ needs.checks.outputs.PKG_VERSION }}-${TARGET}.zip"
-          DEBS_PKG_NAME="${GITHUB_WORKSPACE}/zplugin-dds-${{ needs.checks.outputs.PKG_VERSION }}-${TARGET}-deb-pkgs.zip"
+          DEBS_PKG_NAME="${GITHUB_WORKSPACE}/zenoh-plugin-dds-${{ needs.checks.outputs.PKG_VERSION }}-${TARGET}-deb-pkgs.zip"
 
           case ${TARGET} in
             *linux*)
               cd "target/${TARGET}/release/"
               echo "Packaging ${LIB_PKG_NAME}:"
-              zip ${LIB_PKG_NAME} libzplugin*.so
+              zip ${LIB_PKG_NAME} libzenoh_plugin*.so
               echo "Packaging ${BIN_PKG_NAME}:"
               zip ${BIN_PKG_NAME} zenoh-bridge-dds
               cd -
-              echo ::set-output name=LIB_PKG_NAME::"${LIB_PKG_NAME}"
-              echo ::set-output name=BIN_PKG_NAME::"${BIN_PKG_NAME}"
+              echo "LIB_PKG_NAME=${LIB_PKG_NAME}" >> $GITHUB_OUTPUT
+              echo "BIN_PKG_NAME=${BIN_PKG_NAME}" >> $GITHUB_OUTPUT
 
               # check if debian packages has been created and packages them in a single tgz
               if [[ -d target/${TARGET}/debian ]]; then
@@ -257,28 +226,28 @@ jobs:
                 echo "Packaging ${DEBS_PKG_NAME}:"
                 zip ${DEBS_PKG_NAME} *.deb
                 cd -
-                echo ::set-output name=DEBS_PKG_NAME::"${DEBS_PKG_NAME}"
+                echo "DEBS_PKG_NAME=${DEBS_PKG_NAME}" >> $GITHUB_OUTPUT
               fi
               ;;
             *apple*)
               cd "target/${TARGET}/release/"
               echo "Packaging ${LIB_PKG_NAME}:"
-              zip ${LIB_PKG_NAME} libzplugin*.dylib
+              zip ${LIB_PKG_NAME} libzenoh_plugin*.dylib
               echo "Packaging ${BIN_PKG_NAME}:"
               zip ${BIN_PKG_NAME} zenoh-bridge-dds
               cd -
-              echo ::set-output name=LIB_PKG_NAME::"${LIB_PKG_NAME}"
-              echo ::set-output name=BIN_PKG_NAME::"${BIN_PKG_NAME}"
+              echo "LIB_PKG_NAME=${LIB_PKG_NAME}" >> $GITHUB_OUTPUT
+              echo "BIN_PKG_NAME=${BIN_PKG_NAME}" >> $GITHUB_OUTPUT
               ;;
             *windows*)
               cd "target/${TARGET}/release/"
               echo "Packaging ${LIB_PKG_NAME}:"
-              7z -y a "${LIB_PKG_NAME}" zplugin*.dll
+              7z -y a "${LIB_PKG_NAME}" zenoh-plugin*.dll
               echo "Packaging ${BIN_PKG_NAME}:"
               7z -y a "${BIN_PKG_NAME}" zenoh-bridge-dds.exe
               cd -
-              echo ::set-output name=LIB_PKG_NAME::"${LIB_PKG_NAME}"
-              echo ::set-output name=BIN_PKG_NAME::"${BIN_PKG_NAME}"
+              echo "LIB_PKG_NAME=${LIB_PKG_NAME}" >> $GITHUB_OUTPUT
+              echo "BIN_PKG_NAME=${BIN_PKG_NAME}" >> $GITHUB_OUTPUT
               ;;
           esac
 
@@ -291,8 +260,53 @@ jobs:
             ${{ steps.package.outputs.BIN_PKG_NAME }}
             ${{ steps.package.outputs.DEBS_PKG_NAME }}
 
+  docker-build:
+    name: Docker build and push
+    needs: [checks, builds]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+        with:
+          fetch-depth: 500 # NOTE: get long history for git-version crate to correctly compute a version
+      - name: Fetch Git tags # NOTE: workaround for https://github.com/actions/checkout/issues/290
+        shell: bash
+        run: git fetch --tags --force
+      - name: Download packages from previous job
+        uses: actions/download-artifact@v2
+        with:
+          path: PACKAGES
+      - name: Unzip PACKAGES
+        run: |
+          ls PACKAGES
+          mkdir -p docker/linux/amd
+          unzip PACKAGES/x86_64-unknown-linux-musl/zenoh-bridge-dds-${{ needs.checks.outputs.PKG_VERSION }}-x86_64-unknown-linux-musl.zip -d docker/linux/amd64/
+          mkdir -p docker/linux/arm64
+          unzip PACKAGES/aarch64-unknown-linux-musl/zenoh-bridge-dds-${{ needs.checks.outputs.PKG_VERSION }}-aarch64-unknown-linux-musl.zip -d docker/linux/arm64/
+          tree docker
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v1
+      - name: Docker meta - set tags and labels
+        id: meta
+        uses: docker/metadata-action@v3
+        with:
+          images: eclipse/zenoh-bridge-dds
+      - name: Login to DockerHub
+        uses: docker/login-action@v1
+        with:
+          username: ${{ secrets.DOCKER_COM_USERNAME }}
+          password: ${{ secrets.DOCKER_COM_PASSWORD }}
+      - name: Build and push
+        uses: docker/build-push-action@v2
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          file: .github/workflows/Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+
   publication:
-    name: Publish the release
+    name: Release publication
     if: needs.checks.outputs.IS_RELEASE == 'true'
     needs: [checks, builds]
     runs-on: ubuntu-latest
@@ -328,3 +342,11 @@ jobs:
           scp -o "StrictHostKeyChecking=no" -r * ${SSH_TARGET}:${DOWNLOAD_DIR}/
           echo "---- cleanup identity"
           ssh-add -D
+      - uses: actions/checkout@v2
+      - name: Install Rust toolchain
+        uses: actions-rs/toolchain@v1
+      - name: Publish to crates.io
+        shell: bash
+        run: |
+          cargo login ${{ secrets.CRATES_IO_TOKEN }}
+          (cd zenoh-plugin-dds && cargo publish)

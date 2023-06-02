@@ -26,7 +26,7 @@ pub const DDS_INFINITE_TIME: i64 = 0x7FFFFFFFFFFFFFFF;
 pub const DDS_100MS_DURATION: i64 = 100 * 1_000_000;
 pub const DDS_1S_DURATION: i64 = 1_000_000_000;
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct Qos {
     pub durability: Durability,
     pub durability_service: DurabilityService,
@@ -38,6 +38,7 @@ pub struct Qos {
     pub destination_order: DestinationOrder,
     pub history: History,
     pub partitions: Vec<String>,
+    pub userdata: Vec<u8>,
     #[serde(skip)]
     pub ignore_local_participant: bool,
 }
@@ -152,16 +153,37 @@ impl Qos {
             // partitions
             let mut n = 0u32;
             let mut ps: *mut *mut ::std::os::raw::c_char = std::ptr::null_mut();
-            let _ = dds_qget_partition(
+            let partitions = if dds_qget_partition(
                 qos,
                 &mut n as *mut u32,
                 &mut ps as *mut *mut *mut ::std::os::raw::c_char,
-            );
-            let mut partitions: Vec<String> = Vec::with_capacity(n as usize);
-            for k in 0..n {
-                let p = CStr::from_ptr(*(ps.offset(k as isize))).to_str().unwrap();
-                partitions.push(String::from(p));
-            }
+            ) {
+                let mut partitions: Vec<String> = Vec::with_capacity(n as usize);
+                for k in 0..n {
+                    let p = CStr::from_ptr(*(ps.offset(k as isize))).to_str().unwrap();
+                    partitions.push(String::from(p));
+                }
+                partitions
+            } else {
+                Vec::new()
+            };
+
+            // userdata
+            let mut sz: size_t = 0;
+            let mut value: *mut ::std::os::raw::c_void = std::ptr::null_mut();
+            let userdata = if dds_qget_userdata(
+                qos,
+                &mut value as *mut *mut ::std::os::raw::c_void,
+                &mut sz as *mut size_t,
+            ) {
+                Vec::from_raw_parts(
+                    value as *mut ::std::os::raw::c_uchar,
+                    sz as usize,
+                    sz as usize,
+                )
+            } else {
+                Vec::new()
+            };
 
             Self {
                 durability,
@@ -174,6 +196,7 @@ impl Qos {
                 destination_order,
                 history,
                 partitions,
+                userdata,
                 ignore_local_participant: false,
             }
         }
@@ -279,6 +302,11 @@ impl Qos {
                 dds_qset_partition(qos, len as u32, ptr);
                 drop(Vec::from_raw_parts(ptr, len, cap));
             }
+            // userdata
+            if !self.userdata.is_empty() {
+                let (ptr, len, _) = vec_into_raw_parts(self.userdata.clone());
+                dds_qset_userdata(qos, ptr as *const ::std::os::raw::c_void, len as size_t);
+            }
             // ignore_local_participant
             if self.ignore_local_participant {
                 dds_qset_ignorelocal(qos, dds_ignorelocal_kind_DDS_IGNORELOCAL_PARTICIPANT);
@@ -303,14 +331,14 @@ impl Default for Qos {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Derivative)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, Derivative)]
 #[derivative(Default)]
 pub struct Durability {
     #[derivative(Default(value = "DurabilityKind::VOLATILE"))]
     pub kind: DurabilityKind,
 }
 
-#[derive(Debug, Copy, Clone, Deserialize, Serialize, PartialEq)]
+#[derive(Debug, Copy, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[allow(non_camel_case_types, clippy::upper_case_acronyms)]
 pub enum DurabilityKind {
     VOLATILE = dds_durability_kind_DDS_DURABILITY_VOLATILE as isize,
@@ -332,7 +360,7 @@ impl From<&dds_durability_kind_t> for DurabilityKind {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Derivative)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, Derivative)]
 #[derivative(Default)]
 pub struct DurabilityService {
     #[derivative(Default(value = "0"))]
@@ -349,13 +377,13 @@ pub struct DurabilityService {
     pub max_samples_per_instance: i32,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct Reliability {
     pub kind: ReliabilityKind,
     pub max_blocking_time: dds_duration_t,
 }
 
-#[derive(Debug, Copy, Clone, Deserialize, Serialize, PartialEq)]
+#[derive(Debug, Copy, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[allow(non_camel_case_types, clippy::upper_case_acronyms)]
 pub enum ReliabilityKind {
     BEST_EFFORT = dds_reliability_kind_DDS_RELIABILITY_BEST_EFFORT as isize,
@@ -373,28 +401,28 @@ impl From<&dds_reliability_kind_t> for ReliabilityKind {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Derivative)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, Derivative)]
 #[derivative(Default)]
 pub struct Deadline {
     #[derivative(Default(value = "DDS_INFINITE_TIME"))]
     pub period: dds_duration_t,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Derivative)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, Derivative)]
 #[derivative(Default)]
 pub struct LatencyBudget {
     #[derivative(Default(value = "0"))]
     pub duration: dds_duration_t,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Derivative)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, Derivative)]
 #[derivative(Default)]
 pub struct DestinationOrder {
     #[derivative(Default(value = "DestinationOrderKind::BY_RECEPTION_TIMESTAMP"))]
     pub kind: DestinationOrderKind,
 }
 
-#[derive(Debug, Copy, Clone, Deserialize, Serialize, PartialEq)]
+#[derive(Debug, Copy, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[allow(non_camel_case_types, clippy::upper_case_acronyms)]
 pub enum DestinationOrderKind {
     BY_RECEPTION_TIMESTAMP =
@@ -418,7 +446,7 @@ impl From<&dds_destination_order_kind_t> for DestinationOrderKind {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Derivative)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, Derivative)]
 #[derivative(Default)]
 pub struct Liveliness {
     #[derivative(Default(value = "LivelinessKind::AUTOMATIC"))]
@@ -427,7 +455,7 @@ pub struct Liveliness {
     pub lease_duration: dds_duration_t,
 }
 
-#[derive(Debug, Copy, Clone, Deserialize, Serialize, PartialEq)]
+#[derive(Debug, Copy, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[allow(non_camel_case_types, clippy::upper_case_acronyms)]
 pub enum LivelinessKind {
     AUTOMATIC = dds_liveliness_kind_DDS_LIVELINESS_AUTOMATIC as isize,
@@ -449,14 +477,14 @@ impl From<&dds_liveliness_kind_t> for LivelinessKind {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Derivative)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, Derivative)]
 #[derivative(Default)]
 pub struct Ownership {
     #[derivative(Default(value = "OwnershipKind::SHARED"))]
     pub kind: OwnershipKind,
 }
 
-#[derive(Debug, Copy, Clone, Deserialize, Serialize, PartialEq)]
+#[derive(Debug, Copy, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[allow(non_camel_case_types, clippy::upper_case_acronyms)]
 pub enum OwnershipKind {
     SHARED = dds_ownership_kind_DDS_OWNERSHIP_SHARED as isize,
@@ -474,7 +502,7 @@ impl From<&dds_ownership_kind_t> for OwnershipKind {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Derivative)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, Derivative)]
 #[derivative(Default)]
 pub struct History {
     #[derivative(Default(value = "HistoryKind::KEEP_LAST"))]
@@ -483,7 +511,7 @@ pub struct History {
     pub depth: i32,
 }
 
-#[derive(Debug, Copy, Clone, Deserialize, Serialize, PartialEq)]
+#[derive(Debug, Copy, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[allow(non_camel_case_types, clippy::upper_case_acronyms)]
 pub enum HistoryKind {
     KEEP_LAST = dds_history_kind_DDS_HISTORY_KEEP_LAST as isize,
@@ -507,7 +535,7 @@ fn test_qos_serialization() {
     let qos = Qos::from_writer_qos_native(native);
     let json = serde_json::to_string(&qos).unwrap();
 
-    println!("{}", json);
+    println!("{json}");
     let qos2 = serde_json::from_str::<Qos>(&json).unwrap();
     assert!(qos == qos2);
 

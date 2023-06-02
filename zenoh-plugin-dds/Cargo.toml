@@ -12,58 +12,55 @@
 #   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 #
 [package]
-name = "zenoh-bridge-dds"
+name = "zenoh-plugin-dds"
 version = { workspace = true }
 authors = { workspace = true }
 edition = { workspace = true }
 repository = { workspace = true }
 homepage = { workspace = true }
 license = { workspace = true }
-categories = ["network-programming"]
-description = "Zenoh bridge for ROS2 and DDS in general"
+categories = ["network-programming", "science::robotics"]
+description = "Zenoh plugin for ROS2 and DDS in general"
+
+[lib]
+name = "zenoh_plugin_dds"
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = ["no_mangle"]
+no_mangle = ["zenoh-plugin-trait/no_mangle"]
 
 [dependencies]
 async-std = { workspace = true, features = ["unstable", "attributes"] }
-async-liveliness-monitor = { workspace = true }
-clap = { workspace = true }
+async-trait = { workspace = true }
+bincode = { workspace = true }
+cdr = { workspace = true }
+cyclors = { workspace = true }
+derivative = { workspace = true }
 env_logger = { workspace = true }
+flume = { workspace = true }
+futures = { workspace = true }
+git-version = { workspace = true }
+hex = { workspace = true }
 lazy_static = { workspace = true }
 log = { workspace = true }
+regex = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
-zenoh  = { workspace = true }
-zenoh-plugin-rest = { workspace = true }
+zenoh = { workspace = true }
+zenoh-collections = { workspace = true }
+zenoh-core = { workspace = true }
+zenoh-ext = { workspace = true }
 zenoh-plugin-trait = { workspace = true }
-zenoh-plugin-dds = { path = "../zenoh-plugin-dds/", default-features = false }
+zenoh-util = { workspace = true }
 
-[[bin]]
-name = "zenoh-bridge-dds"
-path = "src/main.rs"
+[build-dependencies]
+rustc_version = { workspace = true }
 
 [package.metadata.deb]
-name = "zenoh-bridge-dds"
+name = "zenoh-plugin-dds"
 maintainer = "zenoh-dev@eclipse.org"
 copyright = "2017, 2022 ZettaScale Technology Inc."
 section = "net"
 license-file = ["../LICENSE", "0"]
-depends = "$auto"
-maintainer-scripts = ".deb"
-assets = [
-    # binary
-    [
-        "target/release/zenoh-bridge-dds",
-        "/usr/bin/",
-        "755",
-    ],
-    # config file
-    [
-        "../DEFAULT_CONFIG.json5",
-        "/etc/zenoh-bridge-dds/conf.json5",
-        "644",
-    ],
-    # service
-    [
-        ".service/zenoh-bridge-dds.service",
-        "/lib/systemd/system/zenoh-bridge-dds.service",
-        "644",
-    ],
-]
+depends = "zenohd (=0.7.2-dev)"

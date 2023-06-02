@@ -27,7 +27,14 @@ WORKDIR /usr/src/zenoh-plugin-dds
 #  * for zenoh-dds-plugin
 #     - git
 #     - clang
-RUN apt-get update && apt-get -y install g++ cmake git clang
+RUN apt-get update && apt-get -y install g++ git clang wget tar build-essential
+RUN wget https://github.com/Kitware/CMake/releases/download/v3.24.2/cmake-3.24.2-linux-x86_64.tar.gz \
+      -q -O /tmp/cmake-install.tar.gz \
+      && tar xzf /tmp/cmake-install.tar.gz \
+      && cp -r cmake-3.24.2-linux-x86_64/* /usr/ \
+      && rm /tmp/cmake-install.tar.gz
+
+RUN cmake --version
 
 COPY . .
 # if exists, copy .git directory to be used by git-version crate to determine the version
@@ -50,7 +57,7 @@ RUN echo 'echo " * Starting: zenoh-bridge-dds $*"' >> /entrypoint.sh
 RUN echo 'exec zenoh-bridge-dds $*' >> /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
-EXPOSE 7447/udp
+EXPOSE 7446/udp
 EXPOSE 7447/tcp
 EXPOSE 8000/tcp
 
