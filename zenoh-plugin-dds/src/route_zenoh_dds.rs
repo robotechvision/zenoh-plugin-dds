@@ -194,7 +194,7 @@ impl RouteZenohDDS<'_> {
                 .declare_subscriber(ke.clone())
                 .callback(subscriber_callback)
                 .allowed_origin(Locality::Remote) // Allow only remote publications to avoid loops
-                .reliable()
+                .best_effort()
                 .querying()
                 .query_timeout(plugin.config.queries_timeout)
                 .query_selector(query_selector)
@@ -213,7 +213,7 @@ impl RouteZenohDDS<'_> {
                 .declare_subscriber(ke.clone())
                 .callback(subscriber_callback)
                 .allowed_origin(Locality::Remote) // Allow only remote publications to avoid loops
-                .reliable()
+                .best_effort()
                 .res()
                 .await
                 .map_err(|e| {
